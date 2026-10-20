@@ -1,0 +1,11 @@
+[
+    {
+        "question": "Replace with a question about one of your PDFs",
+        "expected_source": "your-document.pdf",
+        "expected_page": 3
+    },
+    {
+        "question": "Another question; expected_page is optional",
+        "expected_source": "another-document.pdf"
+    }
+]

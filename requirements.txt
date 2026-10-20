@@ -1,0 +1,14 @@
+streamlit
+python-dotenv
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+langsmith
+pypdf
+faiss-cpu
+rank-bm25
+flashrank
+
+# Optional: OCR for scanned PDFs ("OCR for scanned PDFs" toggle).
+# rapidocr-onnxruntime

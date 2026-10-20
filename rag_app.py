@@ -4,11 +4,7 @@ import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
+import rag_core
 
 
 # =========================================================
@@ -19,6 +15,10 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
+
+# Number of earlier chat messages sent to the LLM
+# so follow-up questions have context.
+MAX_HISTORY_MESSAGES = 6
 
 if not OPENAI_API_KEY:
     st.error(
@@ -68,14 +68,151 @@ st.write(
 # Session State
 # =========================================================
 
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
+session_defaults = {
+    "vectorstore": None,
+    "bm25_retriever": None,
+    "indexed_files": [],
+    "chunk_count": 0,
+    "messages": [],
+    "index_checked": False,
+}
 
-if "indexed_files" not in st.session_state:
-    st.session_state.indexed_files = []
+for key, value in session_defaults.items():
 
-if "chunk_count" not in st.session_state:
-    st.session_state.chunk_count = 0
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+embeddings = rag_core.get_embeddings(OPENAI_API_KEY)
+
+
+# =========================================================
+# Load saved index (once per session)
+# =========================================================
+
+if not st.session_state.index_checked:
+
+    st.session_state.index_checked = True
+
+    try:
+
+        saved_index = rag_core.load_index(embeddings)
+
+    except Exception as e:
+
+        saved_index = None
+
+        st.warning(
+            f"Could not load the saved index: {e}"
+        )
+
+    if saved_index:
+
+        vectorstore, index_info = saved_index
+
+        st.session_state.vectorstore = vectorstore
+
+        st.session_state.bm25_retriever = rag_core.build_bm25(
+            rag_core.stored_chunks(vectorstore)
+        )
+
+        st.session_state.indexed_files = index_info["files"]
+
+        st.session_state.chunk_count = index_info["chunk_count"]
+
+
+# =========================================================
+# Sidebar
+# =========================================================
+
+with st.sidebar:
+
+    st.header("⚙️ Retrieval Settings")
+
+    use_hybrid = st.toggle(
+        "Hybrid search (BM25 + vector)",
+        value=True,
+        help=(
+            "Combine keyword search (BM25) with semantic "
+            "vector search. Helps with exact terms, codes "
+            "and names that embeddings can miss."
+        )
+    )
+
+    use_reranker = st.toggle(
+        "Re-rank results",
+        value=True,
+        help=(
+            "Score each candidate chunk against the question "
+            "with a cross-encoder model and keep the best."
+        )
+    )
+
+    fetch_k = st.slider(
+        "Candidates per retriever",
+        min_value=5,
+        max_value=50,
+        value=20,
+        help="How many chunks each retriever fetches."
+    )
+
+    top_n = st.slider(
+        "Chunks sent to the LLM",
+        min_value=1,
+        max_value=15,
+        value=5
+    )
+
+    st.divider()
+
+    st.header("📄 Indexing")
+
+    use_ocr = st.toggle(
+        "OCR for scanned PDFs",
+        value=False,
+        help=(
+            "If a PDF has no selectable text, read the text "
+            "from its page images instead. Slower. Requires "
+            "the rapidocr-onnxruntime package."
+        )
+    )
+
+    st.divider()
+
+    st.header("💾 Saved Index")
+
+    if st.session_state.vectorstore:
+
+        st.caption(
+            f"{len(st.session_state.indexed_files)} document(s), "
+            f"{st.session_state.chunk_count} chunks. "
+            "Reloaded automatically next time."
+        )
+
+        if st.button("🗑️ Delete saved index"):
+
+            rag_core.delete_index()
+
+            st.session_state.vectorstore = None
+            st.session_state.bm25_retriever = None
+            st.session_state.indexed_files = []
+            st.session_state.chunk_count = 0
+            st.session_state.messages = []
+
+            st.rerun()
+
+    else:
+
+        st.caption(
+            "No index yet. Upload PDFs to build one."
+        )
+
+    if st.session_state.messages:
+
+        if st.button("🧹 Clear chat"):
+
+            st.session_state.messages = []
+
+            st.rerun()
 
 
 # =========================================================
@@ -101,233 +238,243 @@ if uploaded_files:
 
     if st.button(
         "🔨 Build Vector Database",
-        type="primary"
+        type="primary",
+        help="Replaces any previously saved index."
     ):
 
-        all_documents = []
+        # All build logs go inside this status box. If a
+        # step fails, st.stop() leaves it open in the error
+        # state so the logs stay visible. On success the
+        # page reruns, which clears the logs.
+        with st.status(
+            "Building vector database...",
+            expanded=True
+        ) as build_status:
 
-        progress = st.progress(0)
+            all_documents = []
 
-        # -------------------------------------------------
-        # Step 1: Load PDFs
-        # -------------------------------------------------
+            progress = st.progress(0)
 
-        st.subheader("1️⃣ Reading PDFs")
+            # ---------------------------------------------
+            # Step 1: Load PDFs
+            # ---------------------------------------------
 
-        for index, uploaded_file in enumerate(
-            uploaded_files
-        ):
+            st.write("**1️⃣ Reading PDFs**")
+
+            for index, uploaded_file in enumerate(
+                uploaded_files
+            ):
+
+                temp_file_path = None
+
+                try:
+
+                    # Save uploaded PDF temporarily
+                    with tempfile.NamedTemporaryFile(
+                        delete=False,
+                        suffix=".pdf"
+                    ) as temp_file:
+
+                        temp_file.write(
+                            uploaded_file.getvalue()
+                        )
+
+                        temp_file_path = temp_file.name
+
+                    documents, used_ocr = rag_core.load_pdf(
+                        temp_file_path,
+                        uploaded_file.name,
+                        use_ocr=use_ocr
+                    )
+
+                    all_documents.extend(documents)
+
+                    st.write(
+                        f"✓ {uploaded_file.name}: "
+                        f"{len(documents)} page(s)"
+                        + (" (OCR)" if used_ocr else "")
+                    )
+
+                except Exception as e:
+
+                    st.error(
+                        f"Error reading {uploaded_file.name}: "
+                        f"{str(e)}"
+                    )
+
+                finally:
+
+                    if (
+                        temp_file_path
+                        and os.path.exists(temp_file_path)
+                    ):
+                        os.remove(temp_file_path)
+
+                progress.progress(
+                    int(
+                        ((index + 1) /
+                         len(uploaded_files)) * 30
+                    )
+                )
+
+            # ---------------------------------------------
+            # Check extracted documents
+            # ---------------------------------------------
+
+            if not all_documents:
+
+                st.error(
+                    "❌ No pages were extracted from the "
+                    "uploaded PDFs."
+                )
+
+                st.stop()
+
+            # ---------------------------------------------
+            # Step 2: Split documents
+            # ---------------------------------------------
+
+            st.write("**2️⃣ Creating Chunks**")
+
+            chunks = rag_core.split_documents(all_documents)
+
+            if not chunks:
+
+                st.error(
+                    "❌ No text chunks were created."
+                )
+
+                st.info(
+                    "The uploaded PDFs may contain scanned "
+                    "images instead of selectable text. "
+                    "Turn on **OCR for scanned PDFs** in the "
+                    "sidebar and build again."
+                )
+
+                st.stop()
 
             st.write(
-                f"Reading: **{uploaded_file.name}**"
+                f"✓ {len(all_documents)} pages → "
+                f"{len(chunks)} chunks"
             )
 
-            temp_file_path = None
+            progress.progress(50)
+
+            # ---------------------------------------------
+            # Step 3: Create embeddings
+            # ---------------------------------------------
+
+            st.write("**3️⃣ Checking Embedding Model**")
 
             try:
 
-                # Save uploaded PDF temporarily
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".pdf"
-                ) as temp_file:
-
-                    temp_file.write(
-                        uploaded_file.getvalue()
-                    )
-
-                    temp_file_path = temp_file.name
-
-                # Load PDF
-                loader = PyPDFLoader(
-                    temp_file_path
+                # Test the embedding model explicitly.
+                test_embedding = embeddings.embed_query(
+                    "test"
                 )
 
-                documents = loader.load()
+                if not test_embedding:
 
-                # Add useful metadata
-                for document in documents:
+                    st.error(
+                        "❌ OpenAI returned an empty embedding."
+                    )
 
-                    document.metadata[
-                        "source"
-                    ] = uploaded_file.name
+                    st.stop()
 
-                    # PyPDFLoader page numbers are
-                    # zero-based. Convert to 1-based.
-                    if "page" in document.metadata:
-
-                        document.metadata[
-                            "page"
-                        ] = (
-                            document.metadata["page"] + 1
-                        )
-
-                all_documents.extend(documents)
-
-                st.success(
-                    f"✓ {uploaded_file.name}: "
-                    f"{len(documents)} page(s)"
+                st.write(
+                    f"✓ Embedding model working "
+                    f"({len(test_embedding)} dimensions)"
                 )
 
             except Exception as e:
 
                 st.error(
-                    f"Error reading {uploaded_file.name}: "
-                    f"{str(e)}"
+                    "❌ Failed to create embeddings."
                 )
 
-            finally:
+                st.exception(e)
 
-                if (
-                    temp_file_path
-                    and os.path.exists(temp_file_path)
-                ):
-                    os.remove(temp_file_path)
-
-            progress.progress(
-                int(
-                    ((index + 1) /
-                     len(uploaded_files)) * 30
-                )
-            )
-
-        # -------------------------------------------------
-        # Check extracted documents
-        # -------------------------------------------------
-
-        if not all_documents:
-
-            st.error(
-                "❌ No pages were extracted from the "
-                "uploaded PDFs."
-            )
-
-            st.info(
-                "Please check that your PDFs contain "
-                "selectable text. Scanned/image-only PDFs "
-                "need OCR before they can be indexed."
-            )
-
-            st.stop()
-
-        st.success(
-            f"✓ Total pages loaded: "
-            f"{len(all_documents)}"
-        )
-
-        # -------------------------------------------------
-        # Step 2: Split documents
-        # -------------------------------------------------
-
-        st.subheader("2️⃣ Creating Chunks")
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150,
-            length_function=len,
-        )
-
-        chunks = text_splitter.split_documents(
-            all_documents
-        )
-
-        # Remove completely empty chunks
-        chunks = [
-            chunk
-            for chunk in chunks
-            if chunk.page_content
-            and chunk.page_content.strip()
-        ]
-
-        if not chunks:
-
-            st.error(
-                "❌ No text chunks were created."
-            )
-
-            st.info(
-                "The uploaded PDFs may contain scanned "
-                "images instead of selectable text."
-            )
-
-            st.stop()
-
-        st.success(
-            f"✓ Created {len(chunks)} chunks"
-        )
-
-        progress.progress(50)
-
-        # -------------------------------------------------
-        # Step 3: Create embeddings
-        # -------------------------------------------------
-
-        st.subheader("3️⃣ Creating Embeddings")
-
-        try:
-
-            embeddings = OpenAIEmbeddings(
-                model="text-embedding-3-small",
-                api_key=OPENAI_API_KEY
-            )
-
-            # Test the embedding model explicitly.
-            test_embedding = embeddings.embed_query(
-                "test"
-            )
-
-            if not test_embedding:
-
-                st.error(
-                    "❌ OpenAI returned an empty embedding."
+                st.info(
+                    "Check your OPENAI_API_KEY, OpenAI "
+                    "account/billing, and internet connection."
                 )
 
                 st.stop()
 
-            st.success(
-                f"✓ Embedding model working "
-                f"({len(test_embedding)} dimensions)"
+            progress.progress(60)
+
+            # ---------------------------------------------
+            # Step 4: Create FAISS Vector Store
+            # ---------------------------------------------
+
+            st.write("**4️⃣ Building FAISS Vector Database**")
+
+            try:
+
+                vectorstore = rag_core.create_vectorstore(
+                    chunks,
+                    embeddings
+                )
+
+            except Exception as e:
+
+                st.error(
+                    "❌ Failed to create FAISS vector database."
+                )
+
+                st.exception(e)
+
+                st.stop()
+
+            progress.progress(85)
+
+            # ---------------------------------------------
+            # Step 5: Create BM25 keyword index
+            # ---------------------------------------------
+
+            st.write("**5️⃣ Building BM25 Keyword Index**")
+
+            bm25_retriever = rag_core.build_bm25(chunks)
+
+            # ---------------------------------------------
+            # Step 6: Save index to disk
+            # ---------------------------------------------
+
+            st.write("**6️⃣ Saving Index**")
+
+            indexed_files = [
+                file.name
+                for file in uploaded_files
+            ]
+
+            build_message = (
+                f"🎉 Vector database ready: "
+                f"{len(indexed_files)} file(s), "
+                f"{len(chunks)} chunks."
             )
 
-        except Exception as e:
+            try:
 
-            st.error(
-                "❌ Failed to create embeddings."
+                rag_core.save_index(
+                    vectorstore,
+                    indexed_files,
+                    len(chunks)
+                )
+
+            except Exception as e:
+
+                build_message += (
+                    f" It could not be saved to disk ({e}), "
+                    f"so it will only last for this session."
+                )
+
+            progress.progress(100)
+
+            build_status.update(
+                label="Vector database ready",
+                state="complete",
+                expanded=False
             )
-
-            st.exception(e)
-
-            st.info(
-                "Check your OPENAI_API_KEY, OpenAI "
-                "account/billing, and internet connection."
-            )
-
-            st.stop()
-
-        progress.progress(70)
-
-        # -------------------------------------------------
-        # Step 4: Create FAISS Vector Store
-        # -------------------------------------------------
-
-        st.subheader("4️⃣ Building FAISS Vector Database")
-
-        try:
-
-            vectorstore = FAISS.from_documents(
-                chunks,
-                embeddings
-            )
-
-        except Exception as e:
-
-            st.error(
-                "❌ Failed to create FAISS vector database."
-            )
-
-            st.exception(e)
-
-            st.stop()
 
         # -------------------------------------------------
         # Store in Streamlit session state
@@ -335,25 +482,26 @@ if uploaded_files:
 
         st.session_state.vectorstore = vectorstore
 
-        st.session_state.indexed_files = [
-            file.name
-            for file in uploaded_files
-        ]
+        st.session_state.bm25_retriever = bm25_retriever
 
-        st.session_state.chunk_count = len(
-            chunks
-        )
+        st.session_state.indexed_files = indexed_files
 
-        progress.progress(100)
+        st.session_state.chunk_count = len(chunks)
 
-        st.success(
-            f"🎉 Vector database created successfully!"
-        )
+        # Old answers refer to the old documents.
+        st.session_state.messages = []
 
-        st.metric(
-            "Chunks Indexed",
-            len(chunks)
-        )
+        st.session_state.build_message = build_message
+
+        # Rerun so the build logs are cleared before
+        # the user starts chatting.
+        st.rerun()
+
+
+# Shown once, on the run right after a successful build.
+if "build_message" in st.session_state:
+
+    st.toast(st.session_state.pop("build_message"))
 
 
 # =========================================================
@@ -364,279 +512,200 @@ if st.session_state.vectorstore:
 
     st.divider()
 
-    st.subheader("📊 Indexed Documents")
+    with st.expander(
+        f"📊 Indexed Documents "
+        f"({len(st.session_state.indexed_files)} files, "
+        f"{st.session_state.chunk_count} chunks)"
+    ):
 
-    col1, col2 = st.columns(2)
+        for filename in st.session_state.indexed_files:
 
-    with col1:
-
-        st.metric(
-            "Documents",
-            len(st.session_state.indexed_files)
-        )
-
-    with col2:
-
-        st.metric(
-            "Chunks",
-            st.session_state.chunk_count
-        )
-
-    st.write("**Files:**")
-
-    for filename in st.session_state.indexed_files:
-
-        st.write(f"📄 {filename}")
+            st.write(f"📄 {filename}")
 
 
 # =========================================================
-# Question Answering
+# Chat
 # =========================================================
 
-if st.session_state.vectorstore:
+def show_retrieval_details(message):
 
-    st.divider()
+    if message["search_query"] != message["question"]:
 
-    st.subheader("💬 Ask a Question")
+        st.caption(
+            f"🔎 Searched for: {message['search_query']}"
+        )
 
-    question = st.text_input(
-        "Enter your question",
-        placeholder=(
-            "Example: What is the main topic "
-            "of these documents?"
+    sources = []
+
+    for chunk in message["chunks"]:
+
+        source = (chunk["source"], chunk["page"])
+
+        if source not in sources:
+            sources.append(source)
+
+    st.markdown(
+        "**Sources:** "
+        + " · ".join(
+            f"📄 {filename} (p. {page})"
+            for filename, page in sources
         )
     )
 
-    if st.button("🔍 Ask Question") and question:
+    with st.expander("🔎 View Retrieved Chunks"):
 
-        vectorstore = (
-            st.session_state.vectorstore
-        )
-
-        # -------------------------------------------------
-        # Retrieve relevant chunks
-        # -------------------------------------------------
-
-        retriever = vectorstore.as_retriever(
-            search_kwargs={
-                "k": 5
-            }
-        )
-
-        try:
-
-            retrieved_documents = (
-                retriever.invoke(question)
-            )
-
-        except Exception as e:
-
-            st.error(
-                "Failed to retrieve documents."
-            )
-
-            st.exception(e)
-
-            st.stop()
-
-        if not retrieved_documents:
-
-            st.warning(
-                "No relevant information was found "
-                "in the uploaded documents."
-            )
-
-            st.stop()
-
-        # -------------------------------------------------
-        # Create context
-        # -------------------------------------------------
-
-        context_parts = []
-
-        for document in retrieved_documents:
-
-            filename = document.metadata.get(
-                "source",
-                "Unknown file"
-            )
-
-            page = document.metadata.get(
-                "page",
-                "Unknown"
-            )
-
-            context_parts.append(
-                f"""
-File: {filename}
-Page: {page}
-
-Content:
-{document.page_content}
-"""
-            )
-
-        context = "\n\n".join(
-            context_parts
-        )
-
-        # -------------------------------------------------
-        # LLM
-        # -------------------------------------------------
-
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            api_key=OPENAI_API_KEY
-        )
-
-        # -------------------------------------------------
-        # Prompt
-        # -------------------------------------------------
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """
-You are a document question-answering assistant.
-
-Answer the user's question ONLY using the
-provided document context.
-
-If the answer cannot be found in the
-provided context, say:
-
-"I couldn't find the answer in the uploaded documents."
-
-Do not make up information.
-
-Be concise and clear.
-"""
-                ),
-                (
-                    "human",
-                    """
-Question:
-
-{question}
-
-Document Context:
-
-{context}
-"""
-                )
-            ]
-        )
-
-        # -------------------------------------------------
-        # RAG Chain
-        # -------------------------------------------------
-
-        chain = prompt | llm
-
-        try:
-
-            response = chain.invoke(
-                {
-                    "question": question,
-                    "context": context
-                }
-            )
-
-        except Exception as e:
-
-            st.error(
-                "Failed to generate the answer."
-            )
-
-            st.exception(e)
-
-            st.stop()
-
-        # -------------------------------------------------
-        # Answer
-        # -------------------------------------------------
-
-        st.subheader("📝 Answer")
-
-        st.write(
-            response.content
-        )
-
-        # -------------------------------------------------
-        # Sources
-        # -------------------------------------------------
-
-        st.subheader("📚 Sources")
-
-        sources = []
-
-        for document in retrieved_documents:
-
-            filename = document.metadata.get(
-                "source",
-                "Unknown file"
-            )
-
-            page = document.metadata.get(
-                "page",
-                "Unknown"
-            )
-
-            source = (
-                filename,
-                page
-            )
-
-            if source not in sources:
-
-                sources.append(source)
-
-        for filename, page in sources:
-
-            st.write(
-                f"📄 **{filename}** — "
-                f"Page **{page}**"
-            )
-
-        # -------------------------------------------------
-        # Retrieved chunks
-        # -------------------------------------------------
-
-        with st.expander(
-            "🔎 View Retrieved Chunks"
+        for index, chunk in enumerate(
+            message["chunks"],
+            start=1
         ):
 
-            for index, document in enumerate(
-                retrieved_documents,
-                start=1
-            ):
+            st.markdown(
+                f"**Chunk {index}** — {chunk['source']}, "
+                f"page {chunk['page']}"
+            )
 
-                filename = document.metadata.get(
-                    "source",
-                    "Unknown file"
+            if chunk["score"] is not None:
+
+                st.caption(
+                    f"Relevance score: {chunk['score']:.3f}"
                 )
 
-                page = document.metadata.get(
-                    "page",
-                    "Unknown"
+            st.write(chunk["content"])
+
+            st.divider()
+
+
+if st.session_state.vectorstore:
+
+    st.subheader("💬 Chat with your documents")
+
+    for message in st.session_state.messages:
+
+        with st.chat_message(message["role"]):
+
+            st.markdown(message["content"])
+
+            if message["role"] == "assistant":
+                show_retrieval_details(message)
+
+    question = st.chat_input(
+        "Ask a question about your documents"
+    )
+
+    if question:
+
+        history = [
+            (message["role"], message["content"])
+            for message in st.session_state.messages[
+                -MAX_HISTORY_MESSAGES:
+            ]
+        ]
+
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        st.session_state.messages.append(
+            {"role": "user", "content": question}
+        )
+
+        llm = rag_core.get_llm(OPENAI_API_KEY)
+
+        with st.chat_message("assistant"):
+
+            # ---------------------------------------------
+            # Retrieve relevant chunks
+            # ---------------------------------------------
+
+            try:
+
+                with st.spinner("Searching documents..."):
+
+                    search_query = rag_core.rewrite_question(
+                        llm,
+                        question,
+                        history
+                    )
+
+                    retrieved_documents = rag_core.retrieve(
+                        search_query,
+                        st.session_state.vectorstore,
+                        st.session_state.bm25_retriever,
+                        use_hybrid=use_hybrid,
+                        use_reranker=use_reranker,
+                        fetch_k=fetch_k,
+                        top_n=top_n
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    "Failed to retrieve documents."
                 )
 
-                st.markdown(
-                    f"### Chunk {index}"
+                st.exception(e)
+
+                st.stop()
+
+            if not retrieved_documents:
+
+                st.warning(
+                    "No relevant information was found "
+                    "in the uploaded documents."
                 )
 
-                st.write(
-                    f"**File:** {filename}"
+                st.stop()
+
+            # ---------------------------------------------
+            # Stream the answer
+            # ---------------------------------------------
+
+            try:
+
+                answer = st.write_stream(
+                    rag_core.stream_answer(
+                        llm,
+                        question,
+                        retrieved_documents,
+                        history
+                    )
                 )
 
-                st.write(
-                    f"**Page:** {page}"
+            except Exception as e:
+
+                st.error(
+                    "Failed to generate the answer."
                 )
 
-                st.write(
-                    document.page_content
-                )
+                st.exception(e)
 
-                st.divider()
+                st.stop()
+
+            assistant_message = {
+                "role": "assistant",
+                "content": answer,
+                "question": question,
+                "search_query": search_query,
+                "chunks": [
+                    {
+                        "source": document.metadata.get(
+                            "source",
+                            "Unknown file"
+                        ),
+                        "page": document.metadata.get(
+                            "page",
+                            "Unknown"
+                        ),
+                        "score": document.metadata.get(
+                            "rerank_score"
+                        ),
+                        "content": document.page_content
+                    }
+                    for document in retrieved_documents
+                ]
+            }
+
+            show_retrieval_details(assistant_message)
+
+        st.session_state.messages.append(
+            assistant_message
+        )
